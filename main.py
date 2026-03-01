@@ -1,148 +1,75 @@
 import asyncio
 import datetime
 import logging
-
-import aiosqlite
 import discord
 from discord.ext import commands
+import os
 
 # ==========================
 # CONFIG
 # ==========================
 
-STAFF_ROLE_ID = 1475926935560257710      # still used for roles, NOT for perms
+STAFF_ROLE_ID = 1475926935560257710
 DENIED_ROLE_ID = 1476605634194571467
 BLACKLISTED_ROLE_ID = 1476605812100038910
 
-# Applications ALWAYS go here:
 REVIEW_CHANNEL_ID = 1476226286841106694
 
 COOLDOWN_SECONDS = 2 * 24 * 60 * 60
-DATABASE_PATH = "database.db"
+
+# ==========================
+# IN-MEMORY STORAGE (Option B)
+# ==========================
+
+blacklist = set()
+cooldowns = {}
+applications = {}
+
+# ==========================
+# BOT SETUP
+# ==========================
 
 intents = discord.Intents.default()
 intents.members = True
 intents.message_content = False
 
 bot = commands.Bot(command_prefix="!", intents=intents)
-bot.db: aiosqlite.Connection | None = None
-
 logging.basicConfig(level=logging.INFO)
-# ==========================
-# DATABASE HELPERS
-# ==========================
 
-async def init_db():
-    bot.db = await aiosqlite.connect(DATABASE_PATH)
-    await bot.db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS blacklist (
-            user_id INTEGER PRIMARY KEY,
-            reason TEXT,
-            added_at INTEGER
-        )
-        """
-    )
-    await bot.db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS cooldowns (
-            user_id INTEGER PRIMARY KEY,
-            last_applied_at INTEGER
-        )
-        """
-    )
-    await bot.db.execute(
-        """
-        CREATE TABLE IF NOT EXISTS applications (
-            applicant_id INTEGER PRIMARY KEY,
-            message_id INTEGER,
-            channel_id INTEGER
-        )
-        """
-    )
-    await bot.db.commit()
-
+# ==========================
+# HELPERS (NO DATABASE)
+# ==========================
 
 async def is_blacklisted(user_id: int) -> bool:
-    async with bot.db.execute(
-        "SELECT 1 FROM blacklist WHERE user_id = ?", (user_id,)
-    ) as cursor:
-        return await cursor.fetchone() is not None
-
+    return user_id in blacklist
 
 async def add_to_blacklist(user_id: int, reason: str | None = None):
-    now_ts = int(datetime.datetime.utcnow().timestamp())
-    await bot.db.execute(
-        """
-        INSERT INTO blacklist (user_id, reason, added_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            reason = excluded.reason,
-            added_at = excluded.added_at
-        """,
-        (user_id, reason or "No reason provided.", now_ts),
-    )
-    await bot.db.commit()
-
+    blacklist.add(user_id)
 
 async def remove_from_blacklist(user_id: int):
-    await bot.db.execute("DELETE FROM blacklist WHERE user_id = ?", (user_id,))
-    await bot.db.commit()
+    blacklist.discard(user_id)
 
-
-async def get_last_application_ts(user_id: int) -> int | None:
-    async with bot.db.execute(
-        "SELECT last_applied_at FROM cooldowns WHERE user_id = ?", (user_id,)
-    ) as cursor:
-        row = await cursor.fetchone()
-        return row[0] if row else None
-
+async def get_last_application_ts(user_id: int):
+    return cooldowns.get(user_id)
 
 async def set_last_application_ts(user_id: int):
-    now_ts = int(datetime.datetime.utcnow().timestamp())
-    await bot.db.execute(
-        """
-        INSERT INTO cooldowns (user_id, last_applied_at)
-        VALUES (?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            last_applied_at = excluded.last_applied_at
-        """,
-        (user_id, now_ts),
-    )
-    await bot.db.commit()
-
+    cooldowns[user_id] = int(datetime.datetime.utcnow().timestamp())
 
 async def get_cooldown_remaining(user_id: int) -> int:
-    last_ts = await get_last_application_ts(user_id)
+    last_ts = cooldowns.get(user_id)
     if last_ts is None:
         return 0
     now_ts = int(datetime.datetime.utcnow().timestamp())
     return max(0, COOLDOWN_SECONDS - (now_ts - last_ts))
 
-
 async def save_application_message(applicant_id: int, message_id: int, channel_id: int):
-    await bot.db.execute(
-        """
-        INSERT INTO applications (applicant_id, message_id, channel_id)
-        VALUES (?, ?, ?)
-        ON CONFLICT(applicant_id) DO UPDATE SET
-            message_id = excluded.message_id,
-            channel_id = excluded.channel_id
-        """,
-        (applicant_id, message_id, channel_id),
-    )
-    await bot.db.commit()
-
+    applications[applicant_id] = (message_id, channel_id)
 
 async def get_application_message(applicant_id: int):
-    async with bot.db.execute(
-        "SELECT message_id, channel_id FROM applications WHERE applicant_id = ?",
-        (applicant_id,),
-    ) as cursor:
-        row = await cursor.fetchone()
-        return row if row else None
+    return applications.get(applicant_id)
+
 # ==========================
-# EMBED HELPERS
+# EMBEDS
 # ==========================
 
 def make_panel_embed() -> discord.Embed:
@@ -158,17 +85,12 @@ def make_panel_embed() -> discord.Embed:
     embed.set_footer(text="Challenger Staff Applications")
     return embed
 
-
 def make_blacklisted_embed() -> discord.Embed:
     return discord.Embed(
         title="⛔ You Have Been Blacklisted",
-        description=(
-            "Your application has been **blacklisted**.\n"
-            "You may not apply again."
-        ),
+        description="Your application has been **blacklisted**.\nYou may not apply again.",
         color=discord.Color.dark_red(),
     )
-
 
 def make_cooldown_embed(remaining_seconds: int) -> discord.Embed:
     now = datetime.datetime.utcnow()
@@ -178,14 +100,9 @@ def make_cooldown_embed(remaining_seconds: int) -> discord.Embed:
 
     return discord.Embed(
         title="You recently applied",
-        description=(
-            f"You may reapply on:\n"
-            f"• `{human}`\n"
-            f"• <t:{unix_ts}:R>"
-        ),
+        description=f"You may reapply on:\n• `{human}`\n• <t:{unix_ts}:R>",
         color=discord.Color.orange(),
     )
-
 
 def make_application_embed(member: discord.Member, answers: dict[str, str]) -> discord.Embed:
     embed = discord.Embed(
@@ -213,6 +130,7 @@ def make_application_embed(member: discord.Member, answers: dict[str, str]) -> d
     embed.add_field(name="Applicant", value=f"{member.mention} (`{member.id}`)", inline=False)
     embed.set_footer(text="Use the buttons below to review this application.")
     return embed
+
 # ==========================
 # DM QUESTION FLOW
 # ==========================
@@ -231,7 +149,6 @@ QUESTIONS = [
     ("q_fit", "What makes you a good fit for our staff team?"),
     ("q_understand", "Do you understand that abusing power results in instant removal?"),
 ]
-
 
 async def run_dm_application_flow(member: discord.Member, origin_channel):
     answers = {}
@@ -285,10 +202,10 @@ async def run_dm_application_flow(member: discord.Member, origin_channel):
     view = ReviewView(member.id)
     message = await channel.send(embed=embed, view=view)
 
-    # Save application message for later status editing
     await save_application_message(member.id, message.id, channel.id)
 
     await dm.send("Your application has been submitted successfully!")
+
 # ==========================
 # PANEL BUTTON
 # ==========================
@@ -304,30 +221,24 @@ class ApplyButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         member = interaction.user
 
-        # Blacklist check
         if await is_blacklisted(member.id):
-            # DM to user
             await interaction.response.send_message(
                 embed=make_blacklisted_embed(),
                 ephemeral=True,
             )
 
-            # Log attempt in review channel
             guild = interaction.guild
             review_channel = guild.get_channel(REVIEW_CHANNEL_ID)
 
-            if review_channel is not None:
-                blacklisted_attempt_embed = discord.Embed(
+            if review_channel:
+                embed = discord.Embed(
                     title="⛔ Blacklisted User Attempted to Apply",
-                    description=(
-                        f"{member.mention} (`{member.id}`) attempted to apply but is **blacklisted**."
-                    ),
+                    description=f"{member.mention} (`{member.id}`) attempted to apply but is **blacklisted**.",
                     color=discord.Color.dark_red(),
                 )
-                await review_channel.send(embed=blacklisted_attempt_embed)
+                await review_channel.send(embed=embed)
             return
 
-        # Cooldown check
         remaining = await get_cooldown_remaining(member.id)
         if remaining > 0:
             await interaction.response.send_message(
@@ -343,11 +254,11 @@ class ApplyButton(discord.ui.Button):
 
         await run_dm_application_flow(member, interaction.channel)
 
-
 class PanelView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
         self.add_item(ApplyButton())
+
 # ==========================
 # REVIEW BUTTONS
 # ==========================
@@ -369,11 +280,10 @@ class ReviewView(discord.ui.View):
             return False
         return True
 
-    async def _edit_application_status(self, interaction: discord.Interaction, member: discord.Member,
-                                       color: discord.Color, status_text: str):
+    async def _edit_application_status(self, interaction, member, color, status_text):
         row = await get_application_message(member.id)
         if not row:
-            return  # no stored message
+            return
 
         message_id, channel_id = row
         channel = interaction.guild.get_channel(channel_id)
@@ -392,11 +302,10 @@ class ReviewView(discord.ui.View):
         embed.color = color
         embed.add_field(name="Status", value=status_text, inline=False)
 
-        # Buttons stay active (your choice A)
         await msg.edit(embed=embed, view=self)
 
     @discord.ui.button(label="Approve", style=discord.ButtonStyle.success)
-    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def approve(self, interaction, button):
         if not await self._ensure_owner(interaction):
             return
 
@@ -410,7 +319,7 @@ class ReviewView(discord.ui.View):
         blacklisted_role = interaction.guild.get_role(BLACKLISTED_ROLE_ID)
 
         if denied_role or blacklisted_role:
-            roles_to_remove = [r for r in (denied_role, blacklisted_role) if r is not None]
+            roles_to_remove = [r for r in (denied_role, blacklisted_role) if r]
             if roles_to_remove:
                 await member.remove_roles(*roles_to_remove, reason="Approved")
 
@@ -419,7 +328,6 @@ class ReviewView(discord.ui.View):
 
         await remove_from_blacklist(member.id)
 
-        # DM embed to applicant
         approved_embed = discord.Embed(
             title="🎉 You Have Been Approved!",
             description=(
@@ -439,7 +347,6 @@ class ReviewView(discord.ui.View):
         except:
             pass
 
-        # Edit application embed status (inside original embed)
         await self._edit_application_status(
             interaction,
             member,
@@ -448,7 +355,7 @@ class ReviewView(discord.ui.View):
         )
 
     @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger)
-    async def deny(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def deny(self, interaction, button):
         if not await self._ensure_owner(interaction):
             return
 
@@ -461,7 +368,6 @@ class ReviewView(discord.ui.View):
         if denied_role:
             await member.add_roles(denied_role, reason="Denied")
 
-        # Calculate reapply time based on cooldown
         now = datetime.datetime.utcnow()
         target = now + datetime.timedelta(seconds=COOLDOWN_SECONDS)
         unix_ts = int(target.timestamp())
@@ -483,7 +389,6 @@ class ReviewView(discord.ui.View):
         except:
             pass
 
-        # Edit application embed status
         await self._edit_application_status(
             interaction,
             member,
@@ -492,7 +397,7 @@ class ReviewView(discord.ui.View):
         )
 
     @discord.ui.button(label="Blacklist", style=discord.ButtonStyle.secondary)
-    async def blacklist(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def blacklist_btn(self, interaction, button):
         if not await self._ensure_owner(interaction):
             return
 
@@ -505,21 +410,18 @@ class ReviewView(discord.ui.View):
         denied_role = interaction.guild.get_role(DENIED_ROLE_ID)
         staff_role = interaction.guild.get_role(STAFF_ROLE_ID)
 
-        roles_to_remove = [r for r in (staff_role, denied_role) if r is not None]
+        roles_to_remove = [r for r in (staff_role, denied_role) if r]
         if roles_to_remove:
             await member.remove_roles(*roles_to_remove, reason="Blacklisted")
 
         if blacklisted_role:
             await member.add_roles(blacklisted_role, reason="Blacklisted")
 
-        await add_to_blacklist(member.id, "Blacklisted via review")
+        await add_to_blacklist(member.id)
 
         blacklisted_embed = discord.Embed(
             title="⛔ You Have Been Blacklisted",
-            description=(
-                "Your application has been **blacklisted**.\n"
-                "You may not apply again."
-            ),
+            description="Your application has been **blacklisted**.\nYou may not apply again.",
             color=discord.Color.dark_red(),
         )
 
@@ -528,13 +430,13 @@ class ReviewView(discord.ui.View):
         except:
             pass
 
-        # Edit application embed status
         await self._edit_application_status(
             interaction,
             member,
             discord.Color.dark_red(),
             f"⛔ Blacklisted by {interaction.user.mention}",
         )
+
 # ==========================
 # SLASH COMMANDS
 # ==========================
@@ -547,24 +449,20 @@ async def panel(interaction: discord.Interaction):
         view=PanelView()
     )
 
-
 @bot.tree.command(name="resetcooldown", description="Reset a user's staff application cooldown.")
 @commands.has_permissions(manage_guild=True)
 async def resetcooldown(interaction: discord.Interaction, user: discord.Member):
-    await bot.db.execute("DELETE FROM cooldowns WHERE user_id = ?", (user.id,))
-    await bot.db.commit()
-
+    cooldowns.pop(user.id, None)
     await interaction.response.send_message(
         f"Cooldown reset for {user.mention}.",
         ephemeral=True
     )
+
 @bot.tree.command(name="unblacklist", description="Remove a user from the blacklist.")
 @commands.has_permissions(manage_guild=True)
 async def unblacklist(interaction: discord.Interaction, user: discord.Member):
-    # Remove from database
     await remove_from_blacklist(user.id)
 
-    # Remove blacklisted role if they have it
     blacklisted_role = interaction.guild.get_role(BLACKLISTED_ROLE_ID)
     if blacklisted_role and blacklisted_role in user.roles:
         await user.remove_roles(blacklisted_role, reason="Unblacklisted")
@@ -573,18 +471,16 @@ async def unblacklist(interaction: discord.Interaction, user: discord.Member):
         f"{user.mention} has been **unblacklisted** and can apply again.",
         ephemeral=True
     )
+
 # ==========================
 # BOT EVENTS
 # ==========================
 
 @bot.event
 async def on_ready():
-    await init_db()
     bot.add_view(PanelView())
     await bot.tree.sync()
     print(f"Logged in as {bot.user}")
-
-import os
 
 # ==========================
 # RUN
